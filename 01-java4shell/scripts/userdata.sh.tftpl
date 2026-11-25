@@ -1,0 +1,338 @@
+#!/bin/bash
+# ================================================================================
+# userdata.sh (rendered per node from userdata.sh.tftpl)
+# Runs once on first boot via cloud-init. Installs the pinned Amazon Corretto
+# builds for ALL THREE affected trains (17 / 21 / 25), stands up a minimal
+# Base64-decode service (the realistic exposure surface for CVE-2026-114938) on
+# the decoder train, computes this node's exposure verdict across every installed
+# JDK and serves it as a page.
+#
+# Terraform substitutes the dollar-brace template values below at render time;
+# anything a shell variable needs is written doubled ($$) so it survives to the
+# instance and is expanded by bash there, not by Terraform.
+#
+# >>> This host is intentionally vulnerable by design. It lives in a private
+#     subnet with no inbound path and is reachable only via SSM. Do not deploy
+#     it to a production account or expose it to untrusted networks. <<<
+# ================================================================================
+
+exec > /root/userdata.log 2>&1
+set -x
+export DEBIAN_FRONTEND=noninteractive
+
+# ------------------------------------------------------------------------------
+# Baked-in node identity (from Terraform)
+# ------------------------------------------------------------------------------
+NODE_ROLE="${node_role}"
+EXPECTED="${expected_verdict}"
+EXPECTED_REASON="${expected_reason}"
+ARCH="${arch}"
+DECODER_MAJOR="${decoder_major}"
+DECODER_PORT="${decoder_port}"
+DEPLOYMENT="${deployment_name}"
+# One "major|version|url" line per affected train this node installs.
+JDKS="${jdks}"
+
+APPDIR=/opt/java4shell
+mkdir -p "$${APPDIR}"
+
+# ------------------------------------------------------------------------------
+# Packages
+# ForceIPv4: arm64 pulls from ports.ubuntu.com, whose AAAA records resolve on
+# instances with no IPv6, costing failed attempts per repo before IPv4 fallback.
+# apache2 serves the verdict page (localhost / SSM-tunnel only).
+# ------------------------------------------------------------------------------
+echo "NOTE: installing packages..."
+apt-get -o Acquire::ForceIPv4=true update -y
+apt-get -o Acquire::ForceIPv4=true install -y apache2 curl ca-certificates tar
+
+# ------------------------------------------------------------------------------
+# Install every affected JDK train for this node's architecture.
+# A host carrying several JDKs is the realistic case the detector is built for:
+# check-exposure.sh judges EVERY installed JDK and the node's verdict is the
+# worst across them. A failed download never aborts the node — it stays
+# reachable over SSM and the detector simply reports on whatever installed.
+# ------------------------------------------------------------------------------
+INSTALLED=0
+mapfile -t JDK_LINES <<< "$${JDKS}"
+for line in "$${JDK_LINES[@]}"; do
+  [ -n "$${line}" ] || continue
+  MAJOR="$${line%%|*}"
+  rest="$${line#*|}"
+  VER="$${rest%%|*}"
+  URL="$${rest##*|}"
+  echo "NOTE: [train $${MAJOR}] downloading Corretto $${VER} from $${URL}"
+  if curl -fL --retry 20 --retry-delay 8 --retry-all-errors --retry-connrefused \
+       --connect-timeout 10 -o "/tmp/corretto-$${MAJOR}.tar.gz" "$${URL}"; then
+    TOP=$(tar tzf "/tmp/corretto-$${MAJOR}.tar.gz" | head -1 | cut -d/ -f1)
+    tar xzf "/tmp/corretto-$${MAJOR}.tar.gz" -C /opt
+    echo "NOTE: [train $${MAJOR}] installed /opt/$${TOP}"
+    INSTALLED=$((INSTALLED + 1))
+    if [ "$${MAJOR}" = "$${DECODER_MAJOR}" ]; then
+      ln -sfn "/opt/$${TOP}" "$${APPDIR}/jdk"
+      echo "NOTE: decoder will run on train $${MAJOR} (/opt/$${TOP})"
+    fi
+  else
+    echo "ERROR: [train $${MAJOR}] Corretto download failed from $${URL}"
+    echo "ERROR:   verify the affected build string / URL in variables.tf (it may be pulled)."
+  fi
+done
+echo "$${INSTALLED}" > "$${APPDIR}/jdk_count"
+if [ -L "$${APPDIR}/jdk" ] && [ -x "$${APPDIR}/jdk/bin/java" ]; then
+  echo true > "$${APPDIR}/jdk_ok"
+else
+  echo false > "$${APPDIR}/jdk_ok"
+  echo "WARN: decoder JDK (train $${DECODER_MAJOR}) not installed — decoder will not start."
+fi
+
+# ------------------------------------------------------------------------------
+# Sample Base64 decode service — the exposure surface
+# A normal application endpoint that Base64-decodes caller-supplied input, the
+# way real services decode JWTs, basic-auth headers and encoded parameters. It
+# does nothing with the decoded bytes but report their length: no exec, no
+# deserialization. The CVE-2026-114938 fault is in the JDK's AVX-512 decode
+# intrinsic that this call exercises on a vulnerable build — it is NOT
+# reproduced here, and no exploit payload lives in this repo. Your PoC supplies
+# the malicious input; this app is just the door it knocks on.
+# ------------------------------------------------------------------------------
+cat > "$${APPDIR}/Decoder.java" <<'JAVA_EOF'
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
+
+public class Decoder {
+    public static void main(String[] args) throws Exception {
+        int port = Integer.parseInt(System.getenv().getOrDefault("DECODER_PORT", "8080"));
+        HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
+        server.createContext("/", Decoder::handle);
+        server.setExecutor(null);
+        server.start();
+        System.out.println("java4shell decoder listening on " + port);
+    }
+
+    private static void handle(HttpExchange ex) throws IOException {
+        String data = null;
+        String q = ex.getRequestURI().getRawQuery();
+        if (q != null) {
+            for (String kv : q.split("&")) {
+                String[] p = kv.split("=", 2);
+                if (p.length == 2 && p[0].equals("data")) {
+                    data = URLDecoder.decode(p[1], StandardCharsets.UTF_8);
+                }
+            }
+        }
+        if (data == null) {
+            byte[] body = ex.getRequestBody().readAllBytes();
+            if (body.length > 0) data = new String(body, StandardCharsets.UTF_8).trim();
+        }
+
+        int code = 200;
+        String out;
+        if (data == null || data.isEmpty()) {
+            out = "usage: GET /?data=<base64>  or  POST the base64 string as the body\n";
+        } else {
+            try {
+                // The vulnerable path. On a fixed JDK or a non-AVX-512-VBMI CPU
+                // this is an ordinary decode; nothing here is exploit-specific.
+                byte[] decoded = Base64.getDecoder().decode(data);
+                out = "decoded " + decoded.length + " bytes\n";
+            } catch (IllegalArgumentException e) {
+                code = 400;
+                out = "invalid base64: " + e.getMessage() + "\n";
+            }
+        }
+        byte[] resp = out.getBytes(StandardCharsets.UTF_8);
+        ex.sendResponseHeaders(code, resp.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(resp); }
+    }
+}
+JAVA_EOF
+
+# ------------------------------------------------------------------------------
+# systemd unit for the decoder
+# The vuln node runs the JVM with NO mitigation so it is genuinely exposed.
+# The temporary pre-upgrade workarounds for CVE-2026-114938 are documented here;
+# patch.sh applies the real fix (the version upgrade) rather than a flag.
+#
+#   Researcher / Red Hat RHSB-2026-018 stopgaps (either disables the vulnerable
+#   AVX-512 Base64 intrinsic):
+#     -XX:+UnlockDiagnosticVMOptions -XX:-UseBASE64Intrinsics
+#        (UseBASE64Intrinsics is a diagnostic flag, so it must be unlocked first)
+#     -XX:UseAVX=2
+#        (keeps the AVX2 path, drops AVX-512; x86-only, may be rejected on ARM)
+#   Both are stopgaps only — Oracle's guidance is to upgrade.
+# ------------------------------------------------------------------------------
+cat > /etc/systemd/system/java4shell-decoder.service <<'UNIT_EOF'
+[Unit]
+Description=Java4Shell sample Base64 decode service (intentional exposure surface)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=DECODER_PORT=__DECODER_PORT__
+ExecStart=/opt/java4shell/jdk/bin/java /opt/java4shell/Decoder.java
+# Pre-upgrade mitigation (leave commented so the vuln node stays exposed):
+# ExecStart=/opt/java4shell/jdk/bin/java -XX:+UnlockDiagnosticVMOptions -XX:-UseBASE64Intrinsics /opt/java4shell/Decoder.java
+# ExecStart=/opt/java4shell/jdk/bin/java -XX:UseAVX=2 /opt/java4shell/Decoder.java
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+# Bake the port in (kept out of the quoted heredoc above so it stays literal)
+sed -i "s|__DECODER_PORT__|$${DECODER_PORT}|" /etc/systemd/system/java4shell-decoder.service
+
+# ------------------------------------------------------------------------------
+# check-exposure.sh — the portable, read-only detector. Injected verbatim from
+# the repo file (instances.tf passes file("../check-exposure.sh")), so the node
+# runs the exact same script we ship and viewers lift. ALL detection logic is
+# here; nothing in this lab re-implements it. It already scans every installed
+# JDK, which is exactly why each node carries all three trains.
+# ------------------------------------------------------------------------------
+cat > "$${APPDIR}/check-exposure.sh" <<'DETECTOR_EOF'
+${detector}
+DETECTOR_EOF
+chmod +x "$${APPDIR}/check-exposure.sh"
+
+# ------------------------------------------------------------------------------
+# exposure-check.sh — thin lab wrapper. Runs the detector above, then publishes
+# this node's verdict as a page and echoes the keys validate.sh / lab-verdicts.sh / patch.sh parse over SSM,
+# INCLUDING one JVM| line per installed JDK so the operator tooling can show
+# every train's individual verdict. It holds no detection logic of its own.
+# ------------------------------------------------------------------------------
+cat > "$${APPDIR}/exposure-check.sh" <<'EXPOSURE_EOF'
+#!/bin/bash
+set -uo pipefail
+
+NODE_ROLE="${node_role}"
+EXPECTED="${expected_verdict}"
+DEPLOYMENT="${deployment_name}"
+APPDIR=/opt/java4shell
+
+# Run the portable detector. --no-exec keeps it fast and side-effect-free at
+# boot: versions come from the JDK release files, never by launching java.
+OUT="$("$${APPDIR}/check-exposure.sh" --no-exec --porcelain 2>/dev/null || true)"
+VERDICT=$(printf '%s\n' "$${OUT}" | sed -n 's/^VERDICT=//p'      | head -1)
+VER=$(printf '%s\n'     "$${OUT}" | sed -n 's/^JAVA_VERSION=//p' | head -1)
+ARCH=$(printf '%s\n'    "$${OUT}" | sed -n 's/^ARCH=//p'         | head -1)
+VBMI=$(printf '%s\n'    "$${OUT}" | sed -n 's/^AVX512_VBMI=//p'  | head -1)
+REASON=$(printf '%s\n'  "$${OUT}" | sed -n 's/^REASON=//p'       | head -1)
+JVM_ROWS=$(printf '%s\n' "$${OUT}" | grep '^JVM|' || true)
+JDK_COUNT=$(printf '%s\n' "$${JVM_ROWS}" | grep -c '^JVM|installed' || true)
+INSTALLED_COUNT=$(cat "$${APPDIR}/jdk_count" 2>/dev/null || echo 0)
+
+[ -n "$${VERDICT}" ] || { VERDICT="UNKNOWN"; REASON="detector produced no verdict"; }
+[ -n "$${VER}" ] || VER="none"
+# A lab node is SUPPOSED to carry JDKs. If none installed, or the detector found
+# no JVM at all, say UNKNOWN — never let a missing runtime read as a passing
+# NOT_EXPOSED (that silently hid a broken download).
+if [ "$${INSTALLED_COUNT}" = "0" ] || [ "$${VER}" = "none" ]; then
+  VERDICT="UNKNOWN"
+  REASON="JDKs did not install - verify the affected Corretto build URLs (they may be pulled)"
+  VER="none"
+fi
+MIT="no"; [ "$${VERDICT}" = "MITIGATED" ] && MIT="yes"
+
+# --- Colour for the page ---
+case "$${VERDICT}" in
+  EXPOSED)     COLOR="#ff5c57"; GLYPH="&#x26A0;" ;;
+  NOT_EXPOSED) COLOR="#2ec28a"; GLYPH="&#x2714;" ;;
+  MITIGATED)   COLOR="#f2c163"; GLYPH="&#x1F6E1;" ;;
+  *)           COLOR="#8b949e"; GLYPH="&#x3F;" ;;
+esac
+
+# --- per-JDK fragments, built from the detector's installed JVM rows ---
+#     JVM|installed|<home>|<version>|<verdict>|<reason>
+JDKS_JSON=$(printf '%s\n' "$${JVM_ROWS}" | awk -F'|' \
+  '$2=="installed"{printf "%s{\"version\":\"%s\",\"verdict\":\"%s\"}",(n++?",":""),$4,$5} END{printf ""}')
+JDK_HTML=$(printf '%s\n' "$${JVM_ROWS}" | awk -F'|' \
+  '$2=="installed"{c=($5=="EXPOSED"?"#ff5c57":($5=="NOT_EXPOSED"?"#2ec28a":"#f2c163"));
+    printf "<tr><td class=\"l\">JDK %s</td><td class=\"v\" style=\"color:%s\">%s &rarr; %s</td></tr>\n",$4,c,$4,$5}')
+
+# --- verdict.json (for scripts) ---
+cat > /var/www/html/verdict.json <<JSON
+{"role":"$${NODE_ROLE}","deployment":"$${DEPLOYMENT}","java_version":"$${VER}","arch":"$${ARCH}","avx512_vbmi":"$${VBMI}","mitigated":"$${MIT}","verdict":"$${VERDICT}","expected":"$${EXPECTED}","reason":"$${REASON}","jdk_count":"$${JDK_COUNT}","jdks":[$${JDKS_JSON}]}
+JSON
+
+# --- verdict page (reachable via SSM port-forward to :80) ---
+cat > /var/www/html/index.html <<HTML
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Java4Shell — $${NODE_ROLE}</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0d1117;font-family:-apple-system,'Segoe UI',Arial,sans-serif;
+       min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#161b22;border-radius:8px;border-top:4px solid $${COLOR};
+        padding:40px 44px;width:560px;box-shadow:0 12px 40px rgba(0,0,0,.6)}
+  .tag{display:inline-block;background:#21262d;color:#8b949e;font-size:11px;
+       letter-spacing:1.5px;text-transform:uppercase;padding:4px 9px;border-radius:3px}
+  .verdict{color:$${COLOR};font-size:34px;font-weight:700;margin:22px 0 2px}
+  .reason{color:#adbac7;font-size:14px;margin-bottom:26px}
+  table{width:100%;border-collapse:collapse}
+  tr{border-bottom:1px solid #21262d} tr:last-child{border-bottom:none}
+  td{padding:12px 0} .l{color:#6b7a90;font-size:11px;letter-spacing:1.2px;
+     text-transform:uppercase;width:46%} .v{color:#e6edf3;font-family:'Courier New',monospace;
+     font-size:14px;text-align:right}
+  .foot{margin-top:26px;padding-top:18px;border-top:1px solid #21262d;text-align:center;
+        color:#3a4a5a;font-size:10px;letter-spacing:2px;text-transform:uppercase}
+</style></head><body><div class="card">
+  <span class="tag">CVE-2026-114938 &bull; Java4Shell</span>
+  <div class="verdict">$${GLYPH} $${VERDICT}</div>
+  <div class="reason">$${REASON}</div>
+  <table>
+    <tr><td class="l">Node</td><td class="v">$${NODE_ROLE}</td></tr>
+    <tr><td class="l">Architecture</td><td class="v">$${ARCH}</td></tr>
+    <tr><td class="l">AVX-512 VBMI</td><td class="v">$${VBMI}</td></tr>
+    <tr><td class="l">JDKs installed</td><td class="v">$${JDK_COUNT}</td></tr>
+    $${JDK_HTML}
+    <tr><td class="l">Mitigation flag</td><td class="v">$${MIT}</td></tr>
+    <tr><td class="l">Expected verdict</td><td class="v">$${EXPECTED}</td></tr>
+  </table>
+  <div class="foot">$${DEPLOYMENT} &bull; intentionally vulnerable lab</div>
+</div></body></html>
+HTML
+
+# --- machine-readable summary for Run Command callers ---
+echo "ROLE=$${NODE_ROLE}"
+echo "JAVA_VERSION=$${VER}"
+echo "ARCH=$${ARCH}"
+echo "AVX512_VBMI=$${VBMI}"
+echo "MITIGATED=$${MIT}"
+echo "VERDICT=$${VERDICT}"
+echo "EXPECTED=$${EXPECTED}"
+echo "REASON=$${REASON}"
+echo "JDK_COUNT=$${JDK_COUNT}"
+# One line per installed JDK: JVM|installed|<home>|<version>|<verdict>|<reason>
+printf '%s\n' "$${JVM_ROWS}"
+EXPOSURE_EOF
+chmod +x "$${APPDIR}/exposure-check.sh"
+
+# ------------------------------------------------------------------------------
+# Start services
+# ------------------------------------------------------------------------------
+systemctl daemon-reload
+systemctl enable apache2
+systemctl restart apache2
+
+if [ "$(cat $${APPDIR}/jdk_ok 2>/dev/null)" = "true" ]; then
+  echo "NOTE: starting decoder service..."
+  systemctl enable java4shell-decoder
+  systemctl restart java4shell-decoder
+else
+  echo "WARN: skipping decoder start — decoder JDK not present."
+fi
+
+# Compute and publish the first verdict
+echo "NOTE: computing initial exposure verdict..."
+"$${APPDIR}/exposure-check.sh" || true
+
+echo "NOTE: userdata complete for node $${NODE_ROLE} ($${INSTALLED} JDK(s) installed)."
