@@ -4,7 +4,7 @@ set -uo pipefail
 # ================================================================================
 # patch.sh — remediate a node in place by upgrading its JDKs
 # Every node carries all three affected trains (17 / 21 / 25). This script
-# downloads each train's FIXED Corretto build over SSM, installs it, repoints the
+# downloads each train's FIXED Corretto build over IAP SSH, installs it, repoints the
 # decoder's JDK symlink to the fixed decoder train, REMOVES the vulnerable builds
 # (the detector scans every installed JDK, so a lingering vulnerable one keeps the
 # host EXPOSED), restarts the decoder, and re-runs the on-box exposure check to
@@ -26,14 +26,8 @@ set -uo pipefail
 #   ./patch.sh vuln-x86 17 25        # patch trains 17 and 25, leave 21 vulnerable
 # ================================================================================
 
-CHDIR="01-java4shell"
-REGION=$(terraform -chdir="$CHDIR" output -raw region 2>/dev/null || true)
-if [ -z "${REGION}" ]; then
-  echo "ERROR: could not read Terraform outputs. Run ./apply.sh first."
-  exit 1
-fi
+source ./iap-common.sh
 
-NODE_IDS=$(terraform -chdir="$CHDIR" output -json node_ids)
 PATCH_JDKS=$(terraform -chdir="$CHDIR" output -json patch_jdks)
 NODE_EXPECTED=$(terraform -chdir="$CHDIR" output -json node_expected)
 DECODER_MAJOR=$(terraform -chdir="$CHDIR" output -raw decoder_major)
@@ -53,24 +47,10 @@ else
   fi
 fi
 
-# Run a command on an instance over SSM and echo its stdout.
-run_onbox() {
-  local id="$1" cmd="$2" cid params
-  params=$(jq -nc --arg c "${cmd}" '{commands:[$c]}')
-  cid=$(aws ssm send-command --region "${REGION}" --instance-ids "${id}" \
-    --document-name "AWS-RunShellScript" --parameters "${params}" \
-    --query 'Command.CommandId' --output text)
-  aws ssm wait command-executed --region "${REGION}" \
-    --command-id "${cid}" --instance-id "${id}" >/dev/null 2>&1 || true
-  aws ssm get-command-invocation --region "${REGION}" \
-    --command-id "${cid}" --instance-id "${id}" \
-    --query 'StandardOutputContent' --output text
-}
-
 patch_one() {
   local role="$1" id jq_filter jlist out new_verdict new_java
 
-  id=$(echo "${NODE_IDS}" | jq -r --arg r "${role}" '.[$r] // empty')
+  id=$(node_name "${role}")
   if [ -z "${id}" ]; then
     echo "ERROR: no node named '${role}' in this deployment."; return 1
   fi
@@ -95,10 +75,9 @@ patch_one() {
   # On-box remediation. JLIST and DECODER_MAJOR are expanded HERE by patch.sh;
   # everything else ($VAR) stays literal for the remote shell.
   #
-  # NOTE: SSM AWS-RunShellScript runs this under /bin/sh (dash), not bash, so the
-  # remote half must stay POSIX — no here-strings, mapfile, or [[ ]]. The JDK
-  # list goes through a temp file (not `<<<`), which also keeps the loop in the
-  # current shell so NEWDIRS survives for the prune step.
+  # The remote half is kept POSIX so it runs under any /bin/sh. The JDK list goes
+  # through a temp file (not `<<<`), which also keeps the loop in the current
+  # shell so NEWDIRS survives for the prune step.
   local patch_cmd
   read -r -d '' patch_cmd <<PATCH || true
 set -e

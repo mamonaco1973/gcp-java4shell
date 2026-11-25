@@ -344,7 +344,7 @@ done
 [ -n "$HOST_VERDICT" ] || HOST_VERDICT="NOT_EXPOSED"
 
 if [ "$PORCELAIN" = true ]; then
-  # Keys consumed by the lab's validate.sh / patch.sh over SSM.
+  # Keys consumed by the lab's validate.sh / patch.sh over IAP SSH.
   echo "VERDICT=$HOST_VERDICT"
   echo "JAVA_VERSION=$HOST_VER"
   echo "ARCH=$ARCH"

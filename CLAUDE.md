@@ -1,13 +1,13 @@
-# CLAUDE.md — aws-java4shell
+# CLAUDE.md — gcp-java4shell
 
 ## What This Project Does
 
 An **intentionally vulnerable** educational lab for **CVE-2026-114938**
 ("Java4Shell"), the AVX-512 `java.util.Base64` decode-intrinsic memory
-corruption in OpenJDK. Three EC2 nodes demonstrate that exploitability is
-CPU-bound: a vulnerable JDK is EXPOSED on an x86-64 AVX-512 VBMI CPU but immune
-on ARM64. The repo covers the defensive workflow — exposure detection,
-mitigation, and patch verification.
+corruption in OpenJDK. Three Compute Engine nodes demonstrate that
+exploitability is CPU-bound: a vulnerable JDK is EXPOSED on an x86-64 AVX-512
+VBMI CPU but immune on ARM64 and on x86 without VBMI. The repo covers the
+defensive workflow — exposure detection, mitigation, and patch verification.
 
 **No exploit code lives here by design.** The repo builds the infrastructure
 and the (benign) exposure surface; the user runs the researchers' external PoC
@@ -16,103 +16,94 @@ and the (benign) exposure surface; the user runs the researchers' external PoC
 ## Commands
 
 ```bash
-./apply.sh                      # check env, terraform init + apply, then validate
+./apply.sh                      # check env + APIs, terraform init + apply, then validate
 ./validate.sh                   # assert each node's live verdict == intended, with per-JDK rows
-./lab-verdicts.sh [node...]     # print live verdict(s) + per-JDK breakdown over SSM
+./lab-verdicts.sh [node...]     # print live verdict(s) + per-JDK breakdown over IAP SSH
 ./patch.sh [node] [train...]    # upgrade a node's JDKs in place to the fixed builds, re-check
                                 #   (all 3 trains by default; name trains for a partial/mixed patch)
 ./destroy.sh                    # teardown
 ```
 
+`iap-common.sh` is sourced by validate/lab-verdicts/patch: it reads the
+Terraform outputs and provides `run_onbox` (pipe a script to the node over
+`gcloud compute ssh --tunnel-through-iap`, run as root with stdin closed) and
+`wait_ssh`.
+
 ## Architecture
 
-Single Terraform phase in `01-java4shell/`. No modules, no workspaces, no ALB,
-no ASG, no CloudWatch (dropped from the aws-autoscaling seed).
+Single Terraform phase in `01-java4shell/`. No modules, no workspaces, no load
+balancer, no MIG.
 
-- **Region:** us-east-2 (var.region)
+- **Region/zone:** us-east1 / us-east1-b (`var.region`, `var.zone`). The zone
+  must offer N2 Ice Lake, N1 and C4A. us-central1 avoided (capacity).
+- **Auth:** `./credentials.json` (gitignored service-account key); project ID is
+  read from it. `check_env.sh` activates it and runs `api_setup.sh`
+  (compute, iap, cloudresourcemanager).
 - **Nodes:** three, one per CPU class, and **every node installs all three
   affected trains (17.0.13 + 21.0.13 + 25.0.5)** arch-matched:
-  `vuln-x86` (c7i.large, AVX-512 VBMI → EXPOSED, all three JDKs exposed),
-  `safe-arm` (t4g.micro, ARM → immune), `safe-intel` (t3.micro, x86 without
-  VBMI → immune). The detector judges every installed JDK (worst-wins), so a
-  node's verdict rolls up its per-train verdicts. No pre-patched node;
-  `patch.sh` upgrades all three trains on a node live (or a named subset, which
-  leaves a mixed EXPOSED host). Defined once in `locals.tf` → `local.trains`
-  (the 3 trains) and `local.nodes` (the 3 machines); `var.decoder_train` picks
-  which train the decoder runs on (default 21).
-- **OS:** Ubuntu 24.04 LTS — amd64 for the c7i/t3 nodes, arm64 for the t4g node
-  (two AMI data sources in `main.tf`).
-- **Access:** SSM only — private subnets, no public IP, no SSH, egress-only SG.
+  `vuln-x86` (n2-standard-2 with `min_cpu_platform = "Intel Ice Lake"`, AVX-512
+  VBMI → EXPOSED — the pin is essential, unpinned N2 may land on Cascade Lake),
+  `safe-arm` (c4a-standard-1, Google Axion ARM → immune; Hyperdisk boot only),
+  `safe-intel` (n1-standard-1, Haswell..Skylake, x86 without VBMI → immune).
+  The detector judges every installed JDK (worst-wins). No pre-patched node;
+  `patch.sh` upgrades all three trains live (or a named subset → mixed EXPOSED
+  host). Defined once in `locals.tf` → `local.trains` and `local.nodes`;
+  `var.decoder_train` picks the decoder's train (default 21).
+- **OS:** Ubuntu 24.04 LTS — image families `ubuntu-2404-lts-amd64` /
+  `ubuntu-2404-lts-arm64` (two data sources in `main.tf`).
+- **Access:** IAP only — no external IPs; one firewall rule admits
+  35.235.240.0/20 on tcp 22/80/8080 to the deployment's network tag. Egress via
+  Cloud NAT. No OS Login; gcloud pushes SSH keys to metadata
+  (`metadata["ssh-keys"]` drift is ignored).
+- **Provisioning:** `scripts/userdata.sh.tftpl` is the GCE `startup-script`.
+  The guest agent runs it on EVERY boot, so it exits early if
+  `/root/userdata.done` exists (written last). validate.sh waits on that marker.
 - **Exposure surface:** a minimal Java Base64-decode HTTP service
-  (`scripts/userdata.sh.tftpl` writes `Decoder.java`), run as
-  `java4shell-decoder.service` on the decoder train's JDK.
-- **Verdict:** `/opt/java4shell/exposure-check.sh` (written by user data) is the
-  single source of truth; it writes the verdict page + `verdict.json`.
+  (`Decoder.java`), run as `java4shell-decoder.service` on the decoder train.
+- **Verdict:** `/opt/java4shell/exposure-check.sh` wraps the repo's portable
+  `check-exposure.sh` (injected verbatim) and writes the page + `verdict.json`.
 - **Boot log:** `/root/userdata.log` on each node.
 
 ## JDK Sourcing (important)
 
 JDK builds are Amazon Corretto tarballs, pinned by **build string** in
-`variables.tf` and assembled into URLs in `locals.tf`:
-
-- `corretto_fixed_build` (default `21.0.13.1.2`) — current, downloads fine.
-- `corretto_affected_build` (default `21.0.13.11.1`) — the **vulnerable** build;
-  **a best guess that must be verified**, since Amazon is pulling vulnerable
-  builds post-patch. Confirm `output affected_jdk_url` returns HTTP 200, or set
-  `corretto_affected_url_override` to a self-hosted artifact.
-
-The verdict logic keys off the **upstream** version (`21.0.13` vs `21.0.13.1`),
-which is vendor-independent, so changing vendor/build is a one-line edit.
-
-If the affected download fails at boot, the node still comes up over SSM and its
-verdict reads `UNKNOWN` ("JDK INSTALL FAILED"), never a false `NOT_EXPOSED`.
+`variables.tf` and assembled into URLs in `locals.tf`. Amazon may pull
+vulnerable builds at any time; `check_env.sh` HEAD-checks every affected and
+fixed URL before apply (warning only). `corretto_affected_url_override` lets
+the 21 x64 build be self-hosted. The verdict logic keys off the **upstream**
+version, so vendor/build changes are one-line edits. A failed download reads
+`UNKNOWN`, never a false `NOT_EXPOSED`.
 
 ## Instance Access
 
-Private, no SSH key. Session Manager:
-
 ```bash
-aws ssm start-session --target <instance-id> --region us-east-2
-```
-
-Resolve IDs for this deployment (names carry a per-deploy suffix):
-
-```bash
-terraform -chdir=01-java4shell output -json node_ids
-```
-
-View a verdict page via a port-forward to the node's `:80`:
-
-```bash
-aws ssm start-session --target <id> \
-  --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["80"],"localPortNumber":["8088"]}'
+terraform -chdir=01-java4shell output -json node_names
+gcloud compute ssh <name> --zone us-east1-b --tunnel-through-iap
+gcloud compute start-iap-tunnel <name> 80 --local-host-port=localhost:8088 --zone us-east1-b
 ```
 
 ## Verdict Logic
 
-EXPOSED requires all three: vulnerable JDK (`version < fixed_version`),
-AVX-512 VBMI present, and no mitigation flag on the running JVM. A patched JDK
-or a missing VBMI intrinsic is NOT_EXPOSED outright; a vulnerable JDK+CPU with
-`-XX:-UseBASE64Intrinsics` or `-XX:UseAVX=2` is MITIGATED.
+EXPOSED requires all three: vulnerable JDK, AVX-512 VBMI present, and no
+mitigation flag on the running JVM. A patched JDK or a missing VBMI intrinsic is
+NOT_EXPOSED outright; a vulnerable JDK+CPU with `-XX:-UseBASE64Intrinsics` or
+`-XX:UseAVX=2` is MITIGATED.
 
 ## Multi-Deployment
 
-Every resource name derives from `local.name` (`java4shell-<suffix>`) so the
-stack can deploy more than once per account/region. Scripts resolve resources
-through `terraform output`, never a hardcoded name. Each concurrent deployment
-needs its own state (separate clone or `terraform workspace`).
+Every resource name derives from `local.name` (`java4shell-<suffix>`), and the
+firewall targets that name as a network tag. Scripts resolve resources through
+`terraform output`, never a hardcoded name.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `01-java4shell/main.tf` | providers + two Ubuntu AMI lookups (amd64, arm64) |
-| `01-java4shell/variables.tf` | JDK build strings/URLs, instance types, ports |
+| `01-java4shell/main.tf` | provider (credentials.json) + two Ubuntu image lookups |
+| `01-java4shell/variables.tf` | region/zone, machine types, JDK build strings, ports |
 | `01-java4shell/locals.tf` | name suffix, derived Corretto URLs, `local.nodes` map |
-| `01-java4shell/instances.tf` | the three nodes, rendered from the shared userdata template |
-| `01-java4shell/networking.tf` | VPC, public/private subnets, IGW, NAT |
-| `01-java4shell/security.tf` | single egress-only security group |
-| `01-java4shell/iam.tf` | SSM role + instance profile |
-| `01-java4shell/outputs.tf` | node IDs/IPs, expected verdicts, JDK URLs, SSM hints |
+| `01-java4shell/instances.tf` | the three nodes, startup script rendered from the template |
+| `01-java4shell/networking.tf` | VPC, private subnet, Cloud Router + NAT |
+| `01-java4shell/firewall.tf` | single IAP-only ingress rule |
+| `01-java4shell/outputs.tf` | project/zone, node names/IPs, expected verdicts, JDK URLs, IAP hint |
 | `01-java4shell/scripts/userdata.sh.tftpl` | installs Corretto, writes Decoder.java + exposure-check.sh, serves verdict |

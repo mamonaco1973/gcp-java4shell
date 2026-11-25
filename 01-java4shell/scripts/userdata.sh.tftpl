@@ -1,7 +1,9 @@
 #!/bin/bash
 # ================================================================================
 # userdata.sh (rendered per node from userdata.sh.tftpl)
-# Runs once on first boot via cloud-init. Installs the pinned Amazon Corretto
+# Delivered as the GCE startup-script, which the guest agent runs as root on
+# EVERY boot — so the script guards itself and does its work only once (a reboot
+# must not reinstall the vulnerable JDKs over a ./patch.sh fix). Installs the pinned Amazon Corretto
 # builds for ALL THREE affected trains (17 / 21 / 25), stands up a minimal
 # Base64-decode service (the realistic exposure surface for CVE-2026-114938) on
 # the decoder train, computes this node's exposure verdict across every installed
@@ -11,10 +13,17 @@
 # anything a shell variable needs is written doubled ($$) so it survives to the
 # instance and is expanded by bash there, not by Terraform.
 #
-# >>> This host is intentionally vulnerable by design. It lives in a private
-#     subnet with no inbound path and is reachable only via SSM. Do not deploy
+# >>> This host is intentionally vulnerable by design. It has no external IP,
+#     and its only inbound path is an IAP tunnel. Do not deploy
 #     it to a production account or expose it to untrusted networks. <<<
 # ================================================================================
+
+# Run-once guard: the marker is written at the very end. validate.sh waits for it.
+DONE_MARKER=/root/userdata.done
+if [ -f "$${DONE_MARKER}" ]; then
+  echo "NOTE: java4shell provisioning already complete; nothing to do."
+  exit 0
+fi
 
 exec > /root/userdata.log 2>&1
 set -x
@@ -40,10 +49,14 @@ mkdir -p "$${APPDIR}"
 # Packages
 # ForceIPv4: arm64 pulls from ports.ubuntu.com, whose AAAA records resolve on
 # instances with no IPv6, costing failed attempts per repo before IPv4 fallback.
-# apache2 serves the verdict page (localhost / SSM-tunnel only).
+# apache2 serves the verdict page (reached only through an IAP tunnel).
 # ------------------------------------------------------------------------------
 echo "NOTE: installing packages..."
-apt-get -o Acquire::ForceIPv4=true update -y
+# Cloud NAT can take a few seconds to program after boot; retry the update.
+for i in $(seq 1 20); do
+  apt-get -o Acquire::ForceIPv4=true update -y && break
+  sleep 6
+done
 apt-get -o Acquire::ForceIPv4=true install -y apache2 curl ca-certificates tar
 
 # ------------------------------------------------------------------------------
@@ -51,7 +64,7 @@ apt-get -o Acquire::ForceIPv4=true install -y apache2 curl ca-certificates tar
 # A host carrying several JDKs is the realistic case the detector is built for:
 # check-exposure.sh judges EVERY installed JDK and the node's verdict is the
 # worst across them. A failed download never aborts the node — it stays
-# reachable over SSM and the detector simply reports on whatever installed.
+# reachable over IAP and the detector simply reports on whatever installed.
 # ------------------------------------------------------------------------------
 INSTALLED=0
 mapfile -t JDK_LINES <<< "$${JDKS}"
@@ -203,7 +216,7 @@ chmod +x "$${APPDIR}/check-exposure.sh"
 
 # ------------------------------------------------------------------------------
 # exposure-check.sh — thin lab wrapper. Runs the detector above, then publishes
-# this node's verdict as a page and echoes the keys validate.sh / lab-verdicts.sh / patch.sh parse over SSM,
+# this node's verdict as a page and echoes the keys validate.sh / lab-verdicts.sh / patch.sh parse over IAP SSH,
 # INCLUDING one JVM| line per installed JDK so the operator tooling can show
 # every train's individual verdict. It holds no detection logic of its own.
 # ------------------------------------------------------------------------------
@@ -261,7 +274,7 @@ cat > /var/www/html/verdict.json <<JSON
 {"role":"$${NODE_ROLE}","deployment":"$${DEPLOYMENT}","java_version":"$${VER}","arch":"$${ARCH}","avx512_vbmi":"$${VBMI}","mitigated":"$${MIT}","verdict":"$${VERDICT}","expected":"$${EXPECTED}","reason":"$${REASON}","jdk_count":"$${JDK_COUNT}","jdks":[$${JDKS_JSON}]}
 JSON
 
-# --- verdict page (reachable via SSM port-forward to :80) ---
+# --- verdict page (reachable via an IAP tunnel to :80) ---
 cat > /var/www/html/index.html <<HTML
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
@@ -301,7 +314,7 @@ cat > /var/www/html/index.html <<HTML
 </div></body></html>
 HTML
 
-# --- machine-readable summary for Run Command callers ---
+# --- machine-readable summary for remote (IAP SSH) callers ---
 echo "ROLE=$${NODE_ROLE}"
 echo "JAVA_VERSION=$${VER}"
 echo "ARCH=$${ARCH}"
@@ -336,3 +349,4 @@ echo "NOTE: computing initial exposure verdict..."
 "$${APPDIR}/exposure-check.sh" || true
 
 echo "NOTE: userdata complete for node $${NODE_ROLE} ($${INSTALLED} JDK(s) installed)."
+date -u +%FT%TZ > "$${DONE_MARKER}"

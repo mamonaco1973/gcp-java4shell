@@ -1,15 +1,15 @@
 # ================================================================================
 # Provider Configuration
-# Pins the AWS provider to the 5.x major version. The ~> constraint allows
-# minor-version upgrades (5.1, 5.2...) but blocks 6.x, preventing breaking
-# changes from entering the build silently.
+# Authenticates via credentials.json — the service account key generated during
+# GCP project setup. The project ID is read from the key file, so no variable is
+# needed for it.
 # ================================================================================
 
 terraform {
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
     }
 
     # Supplies the per-deployment name suffix defined in locals.tf
@@ -20,59 +20,36 @@ terraform {
   }
 }
 
-provider "aws" {
-  region = var.region
+locals {
+  credentials = jsondecode(file("../credentials.json"))
+}
+
+provider "google" {
+  project     = local.credentials.project_id
+  credentials = file("../credentials.json")
+  region      = var.region
+  zone        = var.zone
 }
 
 # ================================================================================
-# AMI Lookups — two architectures
-# This lab deliberately mixes architectures: the two "exposed-surface" nodes
-# run on x86-64 (where the AVX-512 VBMI Base64 intrinsic exists and CVE-2026-
-# 114938 is reachable), and the control node runs on ARM64 (Graviton), where
-# the vulnerable intrinsic does not exist at all. So we need both AMIs.
+# Image Lookups — two architectures
+# This lab deliberately mixes architectures: the x86-64 nodes (where the AVX-512
+# VBMI Base64 intrinsic may exist and CVE-2026-114938 is reachable) and the ARM64
+# control node (Google Axion), where the vulnerable intrinsic does not exist at
+# all. So we need both images.
 #
-# Both are Canonical's Ubuntu 24.04 LTS, queried at plan time so no AMI ID is
-# ever hard-coded. The only difference is the architecture token in the name.
+# Both are Canonical's Ubuntu 24.04 LTS, resolved from the image family at plan
+# time so no image name is ever hard-coded.
 # ================================================================================
 
-# x86-64 image for the c7i (Intel Sapphire Rapids) nodes — vuln-jdk21, vuln-jdk17, vuln-jdk25 (and safe-intel on t3)
-data "aws_ami" "ubuntu_x86" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical's official publisher account
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  filter {
-    name   = "root-device-type"
-    values = ["ebs"]
-  }
+# x86-64 image for vuln-x86 (N2 Ice Lake) and safe-intel (N1)
+data "google_compute_image" "ubuntu_x86" {
+  family  = "ubuntu-2404-lts-amd64"
+  project = "ubuntu-os-cloud"
 }
 
-# ARM64 image for the t4g (Graviton) node — safe-arm
-data "aws_ami" "ubuntu_arm" {
-  most_recent = true
-  owners      = ["099720109477"]
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd*/ubuntu-noble-24.04-arm64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  filter {
-    name   = "root-device-type"
-    values = ["ebs"]
-  }
+# ARM64 image for the C4A (Axion) node — safe-arm
+data "google_compute_image" "ubuntu_arm" {
+  family  = "ubuntu-2404-lts-arm64"
+  project = "ubuntu-os-cloud"
 }

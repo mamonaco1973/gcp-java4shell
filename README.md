@@ -6,7 +6,7 @@ Base64` decode intrinsic that Oracle/OpenJDK patched out-of-cycle on
 **2026-11-17**. Built with Terraform in one phase.
 
 The lab's point is **cloud-specific**: exploitability needs an x86-64 CPU with
-**AVX-512 VBMI**, so the *same* vulnerable Java is harmless on **Graviton
+**AVX-512 VBMI**, so the *same* vulnerable Java is harmless on **Google Axion
 (ARM64)**. Three nodes — one per CPU class — make that concrete, and **each
 carries all three affected JDK trains (17 / 21 / 25) at once**, so the detector
 has to judge every installed JDK, not just one. The tooling here handles the
@@ -14,9 +14,10 @@ defensive side — **exposure detection, mitigation, and patch
 verification**.
 
 > ### ⚠️ Intentionally vulnerable — do not deploy to production
-> `vuln-x86` runs known-vulnerable JDKs on purpose. Every node sits in a
-> private subnet with **no inbound path** and is reachable **only through SSM**.
-> Do not run this in a shared or production account, and do not expose it to
+> `vuln-x86` runs known-vulnerable JDKs on purpose. Every node has **no
+> external IP**, and the firewall admits **only Google's IAP range**, so the
+> nodes are reachable **only through an IAP tunnel**.
+> Do not run this in a shared or production project, and do not expose it to
 > untrusted networks. Tear it down when you're done.
 
 > **Scope of this repo:** infrastructure, the exposure surface, the detection
@@ -30,11 +31,14 @@ verification**.
 Every node installs **all three affected trains** — Corretto **17.0.13 +
 21.0.13 + 25.0.5** (arch-matched) — so only the CPU differs between them:
 
-| Node | Instance | CPU feature | JDKs installed | Verdict |
+| Node | Machine type | CPU feature | JDKs installed | Verdict |
 |---|---|---|---|---|
-| **vuln-x86** | `c7i.large` (Intel Sapphire Rapids) | AVX-512 VBMI present | 17.0.13 + 21.0.13 + 25.0.5 (all affected) | **EXPOSED** |
-| **safe-arm** | `t4g.micro` (Graviton2) | ARM64 — no VBMI | same three affected builds (aarch64) | **NOT EXPOSED** (CPU-immune) |
-| **safe-intel** | `t3.micro` (Skylake/Cascade Lake) | x86 but **no VBMI** | same three affected builds | **NOT EXPOSED** (CPU-immune) |
+| **vuln-x86** | `n2-standard-2`, `min_cpu_platform = Intel Ice Lake` | AVX-512 VBMI present | 17.0.13 + 21.0.13 + 25.0.5 (all affected) | **EXPOSED** |
+| **safe-arm** | `c4a-standard-1` (Google Axion) | ARM64 — no VBMI | same three affected builds (aarch64) | **NOT EXPOSED** (CPU-immune) |
+| **safe-intel** | `n1-standard-1` (Haswell–Skylake) | x86 but **no VBMI** | same three affected builds | **NOT EXPOSED** (CPU-immune) |
+
+The Ice Lake pin matters: an unpinned N2 can land on Cascade Lake, which has
+no VBMI, and the "vulnerable" node would quietly read NOT EXPOSED.
 
 Exposure requires **all three** of: a vulnerable JDK, an AVX-512 VBMI CPU, and
 an app that decodes attacker-controlled Base64. All three nodes carry the same
@@ -53,20 +57,21 @@ train (`./patch.sh vuln-x86 17`) to demonstrate a still-exposed mixed host.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="architecture-dark.svg">
-  <img alt="The operator, running the AWS CLI and the public calif.io proof of concept, reaches the lab only through AWS SSM - Session Manager and Run Command - because the nodes have no inbound network path. SSM drives three nodes in private subnets, and every node installs all three affected Java trains at once (Corretto 17.0.13, 21.0.13 and 25.0.5), so the detector must judge every installed JDK. One node is EXPOSED: vuln-x86, a c7i x86 instance with the AVX-512 VBMI instruction the vulnerable intrinsic needs, so all three of its JDKs are exposed. The other two run the same three vulnerable JDKs but are immune because neither has AVX-512 VBMI: safe-arm, a t4g Graviton ARM64 instance, and safe-intel, a t3 x86 instance. There is no pre-patched node; patch.sh upgrades all three trains on a node live to flip it from EXPOSED to not exposed. The nodes egress through a NAT gateway to pull pinned JDK tarballs from the Amazon Corretto archive." src="architecture-light.svg">
+  <img alt="The operator, running the gcloud CLI and the public calif.io proof of concept, reaches the lab only through Google's Identity-Aware Proxy - IAP SSH and TCP tunnels - because the nodes have no external IP and the firewall admits only the IAP range. IAP reaches three nodes on a private subnet, and every node installs all three affected Java trains at once (Corretto 17.0.13, 21.0.13 and 25.0.5), so the detector must judge every installed JDK. One node is EXPOSED: vuln-x86, an n2 Ice Lake x86 instance with the AVX-512 VBMI instruction the vulnerable intrinsic needs, so all three of its JDKs are exposed. The other two run the same three vulnerable JDKs but are immune because neither has AVX-512 VBMI: safe-arm, a c4a Google Axion ARM64 instance, and safe-intel, an n1 x86 instance. There is no pre-patched node; patch.sh upgrades all three trains on a node live to flip it from EXPOSED to not exposed. The nodes egress through Cloud NAT to pull pinned JDK tarballs from the Amazon Corretto archive." src="architecture-light.svg">
 </picture>
 
 Regenerate with `python3 make_diagram.py`.
 
-**`01-java4shell/`** is the whole stack: `networking.tf` (VPC, public/private
-subnets, IGW, NAT), `security.tf` (one egress-only group — no ingress anywhere),
-`iam.tf` (SSM role), `instances.tf` (the three nodes, rendered
-from `locals.tf` + `scripts/userdata.sh.tftpl`), `variables.tf` (the JDK
-coordinates), and `outputs.tf`.
+**`01-java4shell/`** is the whole stack: `networking.tf` (custom VPC, one
+private subnet, Cloud Router + Cloud NAT), `firewall.tf` (one rule: IAP range
+only, on 22/80/8080), `instances.tf` (the three nodes, rendered from
+`locals.tf` + `scripts/userdata.sh.tftpl` as the startup script),
+`variables.tf` (machine types and JDK coordinates), and `outputs.tf`.
 
 ## How a node decides its verdict
 
-Each node's user data installs its pinned Corretto build, starts a **minimal
+Each node's startup script installs its pinned Corretto builds (once — it
+guards against re-running on reboot), starts a **minimal
 Base64-decode HTTP service** (the realistic exposure surface — a normal endpoint
 that decodes caller-supplied input, like code parsing JWTs or basic-auth
 headers), then runs the **portable detector**, `check-exposure.sh` — the exact
@@ -79,7 +84,7 @@ so a node is exposed only when **all three** hold:
    (`17.0.21.1` / `21.0.13.1` / `25.0.5.1` / `27.0.1.1`), with EOL trains and the
    Oracle 8 Performance Pack handled — not a single hardcoded version;
 2. **an AVX-512 VBMI CPU** — the full flag set the vulnerable intrinsic needs
-   (`avx512f`, `avx512bw`, `avx512vbmi`, `bmi2`), so ARM/Graviton is immune;
+   (`avx512f`, `avx512bw`, `avx512vbmi`, `bmi2`), so ARM (Axion, Graviton, Ampere) is immune;
 3. **the intrinsic enabled** — no mitigating JVM flag.
 
 The detector inspects **every** JVM on the box (running ones via `/proc`, plus
@@ -88,27 +93,30 @@ installed JDKs), not just `java` on PATH. Installed JDKs are found through PATH,
 `/usr/share` and `/usr/local` (where apps bundle their own runtime), `/srv`,
 `/app` and user homes. Network mounts are skipped. `--root DIR` adds a
 site-specific path, and `--full` searches every local disk. A thin lab wrapper then serves the
-verdict page on `:80` (reachable via an SSM tunnel).
+verdict page on `:80` (reachable via an IAP tunnel).
 
 ## Commands
 
 | Script | What it does |
 |---|---|
 | `./apply.sh` | check env, `terraform init && apply`, then `validate.sh` |
-| `./validate.sh` | wait for all nodes on SSM, print each live verdict + per-JDK breakdown |
+| `./validate.sh` | wait for IAP SSH and the startup script on all nodes, print each live verdict + per-JDK breakdown |
 | `./check-exposure.sh` | **the portable detector** — read-only, run it on any host (`--porcelain`, `--no-exec`, `--root DIR`, `--full`); the same script the nodes run |
-| `./lab-verdicts.sh [node...]` | print the live verdict + per-JDK breakdown for one/all lab nodes over SSM |
+| `./lab-verdicts.sh [node...]` | print the live verdict + per-JDK breakdown for one/all lab nodes over IAP SSH |
 | `./patch.sh [node] [train...]` | upgrade a node's JDKs in place to the fixed builds, restart, re-check (EXPOSED → NOT_EXPOSED); all three trains by default, or only the named ones |
 | `./destroy.sh` | tear everything down |
 
 ## Prerequisites
 
-* [An AWS Account](https://aws.amazon.com/console/)
-* [Install AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+* [A Google Cloud Account](https://console.cloud.google.com/)
+* [Install gcloud CLI](https://cloud.google.com/sdk/docs/install)
 * [Install Terraform](https://developer.hashicorp.com/terraform/install)
 * [Install jq](https://jqlang.github.io/jq/download/)
+* A service account key saved as `./credentials.json` (gitignored)
 
-No SSH client is needed — access is entirely through SSM Session Manager.
+An OpenSSH client is needed; `gcloud compute ssh --tunnel-through-iap` generates
+and pushes the key for you. `check_env.sh` enables the Compute, IAP and Cloud
+Resource Manager APIs.
 
 ## ⚠️ Verify the vulnerable build before you deploy
 
@@ -133,8 +141,8 @@ misleading "not exposed".
 ## Deploy
 
 ```bash
-git clone https://github.com/mamonaco1973/aws-java4shell.git
-cd aws-java4shell
+git clone https://github.com/mamonaco1973/gcp-java4shell.git
+cd gcp-java4shell
 ./apply.sh
 ```
 
@@ -160,13 +168,12 @@ vuln-x86     EXPOSED      yes    3
 
 ## Try it
 
-1. **See a verdict page.** Open an SSM tunnel to a node's web server and browse it
+1. **See a verdict page.** Open an IAP tunnel to a node's web server and browse it
    (the page lists every installed JDK and its verdict):
    ```bash
-   ID=$(terraform -chdir=01-java4shell output -json node_ids | jq -r '."vuln-x86"')
-   aws ssm start-session --target "$ID" \
-     --document-name AWS-StartPortForwardingSession \
-     --parameters '{"portNumber":["80"],"localPortNumber":["8088"]}'
+   NAME=$(terraform -chdir=01-java4shell output -json node_names | jq -r '."vuln-x86"')
+   ZONE=$(terraform -chdir=01-java4shell output -raw zone)
+   gcloud compute start-iap-tunnel "$NAME" 80 --local-host-port=localhost:8088 --zone "$ZONE"
    # then open http://localhost:8088/
    ```
 2. **Reach the decoder** (the exposure surface) the same way, forwarding
@@ -199,7 +206,9 @@ Sources: [DigiCert advisory](https://www.digicert.com/security-advisories/java4s
 
 ## Notes
 
-- **Lab only.** Intentionally vulnerable; private subnets; SSM-only; HTTP served
-  to localhost over an SSM tunnel. Not for production.
+- **Lab only.** Intentionally vulnerable; no external IPs; IAP-only ingress;
+  HTTP served to localhost over an IAP tunnel. Not for production.
+- **Shell access.** `gcloud compute ssh <name> --zone <zone> --tunnel-through-iap`;
+  the boot log is `/root/userdata.log`.
 - **JDK source.** Amazon Corretto, pinned by build string in `variables.tf`.
 - **Exploit code.** Not in this repo by design — bring your own isolated PoC.

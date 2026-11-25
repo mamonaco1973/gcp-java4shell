@@ -7,40 +7,59 @@
 # ================================================================================
 
 variable "region" {
-  description = "AWS region for the whole stack"
+  description = "GCP region for the whole stack"
   type        = string
-  default     = "us-east-2"
+  default     = "us-east1"
+}
+
+# All three nodes share one zone. us-east1-b offers every machine family the lab
+# needs (N2 Ice Lake, N1, C4A Axion). us-central1 is avoided: it is chronically
+# short of capacity.
+variable "zone" {
+  description = "GCP zone for the three lab nodes"
+  type        = string
+  default     = "us-east1-b"
 }
 
 # --------------------------------------------------------------------------------
-# Instance types — the lab turns on the CPU distinction, so these are chosen
+# Machine types — the lab turns on the CPU distinction, so these are chosen
 # deliberately:
-#   x86_instance_type        c7i (Sapphire Rapids) — HAS AVX-512 VBMI, so the
-#                            vulnerable intrinsic can run. The floor for VBMI is
-#                            a .large; c6i.large (Ice Lake) is a cheaper swap.
-#   intel_novbmi_instance_type  t3 (Skylake/Cascade Lake) — x86 but NO VBMI, so
-#                            it is immune by HARDWARE despite being Intel. This
-#                            is the whole point of the safe-intel node: not all
-#                            x86 is affected, only the chips with the instruction.
-#   arm_instance_type        t4g (Graviton2, ARM64) — no AVX-512 at all, immune.
+#   x86_machine_type          n2-standard-2 pinned to min_cpu_platform
+#                             "Intel Ice Lake" — HAS AVX-512 VBMI, so the
+#                             vulnerable intrinsic can run. N2 can otherwise land
+#                             on Cascade Lake (no VBMI), so the pin is essential.
+#                             c3-standard-4 (Sapphire Rapids) is a pricier swap.
+#   intel_novbmi_machine_type n1-standard-1 (Haswell..Skylake) — x86 but NO VBMI,
+#                             so it is immune by HARDWARE despite being Intel. N1
+#                             never runs on a VBMI-capable generation. This is the
+#                             whole point of the safe-intel node: not all x86 is
+#                             affected, only the chips with the instruction.
+#   arm_machine_type          c4a-standard-1 (Google Axion, ARM64) — no AVX-512
+#                             at all, immune. C4A boots only from Hyperdisk.
 # --------------------------------------------------------------------------------
 
-variable "x86_instance_type" {
-  description = "x86-64 nodes that MUST support AVX-512 VBMI (c7i / c6i / m6i / c7a)"
+variable "x86_machine_type" {
+  description = "x86-64 node that MUST support AVX-512 VBMI (pinned to x86_min_cpu_platform)"
   type        = string
-  default     = "c7i.large"
+  default     = "n2-standard-2"
 }
 
-variable "intel_novbmi_instance_type" {
-  description = "Intel x86 node WITHOUT AVX-512 VBMI (t3), to prove not all x86 is affected"
+variable "x86_min_cpu_platform" {
+  description = "Minimum CPU platform for vuln-x86; Ice Lake or newer carries AVX-512 VBMI"
   type        = string
-  default     = "t3.micro"
+  default     = "Intel Ice Lake"
 }
 
-variable "arm_instance_type" {
-  description = "Instance type for the Graviton/ARM64 control node"
+variable "intel_novbmi_machine_type" {
+  description = "Intel x86 node WITHOUT AVX-512 VBMI (n1), to prove not all x86 is affected"
   type        = string
-  default     = "t4g.micro"
+  default     = "n1-standard-1"
+}
+
+variable "arm_machine_type" {
+  description = "Machine type for the Axion/ARM64 control node"
+  type        = string
+  default     = "c4a-standard-1"
 }
 
 # --------------------------------------------------------------------------------
@@ -78,7 +97,7 @@ variable "corretto_fixed_build" {
 # stage the tarball yourself and set corretto_affected_url_override.
 #
 # If the download fails at boot the node still comes up and stays reachable over
-# SSM — its verdict reads "UNKNOWN / JDK INSTALL FAILED", never a false verdict.
+# IAP — its verdict reads "UNKNOWN / JDK INSTALL FAILED", never a false verdict.
 variable "corretto_affected_build" {
   description = "Corretto build string for the VULNERABLE JDK (reports upstream 21.0.13)"
   type        = string
@@ -157,7 +176,7 @@ variable "fixed_version" {
   default     = "21.0.13.1"
 }
 
-# Port the benign Base64-decode service listens on (localhost / in-VPC only).
+# Port the benign Base64-decode service listens on (reached only through an IAP tunnel).
 variable "decoder_port" {
   description = "TCP port for the sample Base64 decode service (the exposure surface)"
   type        = number

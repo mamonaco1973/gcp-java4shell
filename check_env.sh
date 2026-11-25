@@ -3,14 +3,15 @@ set -euo pipefail
 
 # ================================================================================
 # Environment Check
-# Validates required tools are installed and AWS credentials are active. This lab
-# drives the nodes entirely over SSM, so jq is required (the operator scripts
-# build SSM payloads and parse JSON output with it).
+# Validates required tools are installed and credentials.json is present, then
+# activates the service account and enables the APIs. This lab drives the nodes
+# entirely over IAP SSH, so jq is required (the operator scripts parse Terraform
+# JSON output with it).
 # ================================================================================
 
 echo "NOTE: Validating that required commands are found in your PATH."
 
-for cmd in aws terraform jq; do
+for cmd in gcloud terraform jq; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "ERROR: $cmd is not found in PATH."
     exit 1
@@ -21,18 +22,25 @@ done
 echo "NOTE: All required commands are available."
 
 # ------------------------------------------------------------------------------
-# AWS Credentials
-# sts get-caller-identity is the cheapest way to confirm credentials are active
+# Credentials
+# The GCP provider and the operator scripts authenticate via this key file.
 # ------------------------------------------------------------------------------
 
-echo "NOTE: Checking AWS CLI connection."
-
-if ! aws sts get-caller-identity &>/dev/null; then
-  echo "ERROR: AWS credentials are not configured or have expired."
+if [[ ! -f "./credentials.json" ]]; then
+  echo "ERROR: ./credentials.json not found. Generate a service account key and place it here."
   exit 1
 fi
 
-echo "NOTE: Successfully connected to AWS."
+echo "NOTE: credentials.json found."
+gcloud auth activate-service-account --key-file="./credentials.json"
+echo "NOTE: Service account activated successfully."
+
+# ------------------------------------------------------------------------------
+# API Setup
+# Enable required GCP APIs before Terraform runs — idempotent, safe to re-run.
+# ------------------------------------------------------------------------------
+
+./api_setup.sh
 
 # ------------------------------------------------------------------------------
 # Corretto build preflight (WARNING only, never blocks apply)
@@ -76,13 +84,15 @@ if command -v curl >/dev/null 2>&1; then
     fi
   }
 
-  check "vuln-jdk21 / safe-intel affected (x64)" "$AFF_X64_URL"
-  check "safe-arm affected (aarch64)"            "$(u "$AFF" aarch64)"
-  check "vuln-jdk17 affected (x64)"              "$(u "$AFF17" x64)"
-  check "vuln-jdk25 affected (x64)"              "$(u "$AFF25" x64)"
-  check "patch 21 fixed (x64)"                   "$(u "$FIX21" x64)"
-  check "patch 17 fixed (x64)"                   "$(u "$FIX17" x64)"
-  check "patch 25 fixed (x64)"                   "$(u "$FIX25" x64)"
+  check "21 affected (x64)"     "$AFF_X64_URL"
+  check "21 affected (aarch64)" "$(u "$AFF" aarch64)"
+  check "17 affected (x64)"     "$(u "$AFF17" x64)"
+  check "17 affected (aarch64)" "$(u "$AFF17" aarch64)"
+  check "25 affected (x64)"     "$(u "$AFF25" x64)"
+  check "25 affected (aarch64)" "$(u "$AFF25" aarch64)"
+  check "patch 21 fixed (x64)"  "$(u "$FIX21" x64)"
+  check "patch 17 fixed (x64)"  "$(u "$FIX17" x64)"
+  check "patch 25 fixed (x64)"  "$(u "$FIX25" x64)"
 
   if [ "$warned" -eq 0 ]; then
     echo "NOTE: all pinned Corretto builds resolve."

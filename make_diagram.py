@@ -6,9 +6,9 @@ from inline SVG, so a `prefers-color-scheme` media query inside the document is
 silently dropped. The README pairs them with <picture>, which GitHub honours.
 
 A README diagram is studied, not narrated, so it is COMPLETE rather than
-minimal: the operator and PoC, the SSM plane that is the only way in, all three
+minimal: the operator and PoC, the IAP proxy that is the only way in, all three
 lab nodes (each carrying all three affected JDK trains) with the verdict each is
-built to produce, the NAT gateway the nodes reach out through, and the Corretto
+built to produce, the Cloud NAT the nodes reach out through, and the Corretto
 archive the pinned JDKs come from.
 Run:  python3 make_diagram.py
 """
@@ -91,46 +91,46 @@ def gutter_y(r):
 
 # ------------------------------------------------------------------------------
 # Layout
-# Operator at top, the SSM plane below it (the only way in), the three nodes
+# Operator at top, the IAP proxy below it (the only way in), the three nodes
 # across the middle, and the egress path to the Corretto archive at the bottom.
 #
 # id: (x, y, colour key, icon, title, subtitle[, "dashed"])
 # ------------------------------------------------------------------------------
 NODES.update({
     "op":    (COL[1], ROW[0], "navy", "terminal", "Operator + PoC",
-              "AWS CLI, and your calif.io PoC"),
-    "ssm":   (COL[1], ROW[1], "purple", "key", "AWS SSM",
-              "Session Manager / Run Command"),
+              "gcloud CLI, and your calif.io PoC"),
+    "iap":   (COL[1], ROW[1], "purple", "key", "Identity-Aware Proxy",
+              "SSH + TCP tunnels, 35.235.240.0/20"),
     # One node per CPU class; each carries all three affected trains (17/21/25).
     # The EXPOSED node has the AVX-512 VBMI instruction the intrinsic needs.
     "vuln":  (COL[1], ROW[2], "danger", "cpu", "vuln-x86",
-              "c7i x86 . VBMI . JDK 17+21+25 . EXPOSED"),
+              "n2 Ice Lake . VBMI . 3 JDKs . EXPOSED"),
     # Two immune nodes — same three vulnerable JDKs, but no VBMI path to fire it.
     "arm":   (COL[0], ROW[2], "store", "shield", "safe-arm",
-              "t4g ARM64 . no VBMI . JDK 17+21+25 . safe"),
+              "c4a Axion . no VBMI . 3 JDKs . safe"),
     "intel": (COL[2], ROW[2], "store", "cpu", "safe-intel",
-              "t3 x86 . no VBMI . JDK 17+21+25 . safe"),
-    "nat":   (COL[1], ROW[3], "navy", "network", "NAT gateway",
+              "n1 x86 . no VBMI . 3 JDKs . safe"),
+    "nat":   (COL[1], ROW[3], "navy", "network", "Cloud NAT",
               "egress only - no inbound path exists"),
     "corretto": (COL[2], ROW[3], "local", "database", "Corretto archive",
                  "pinned JDK tarballs, 3 trains (verify)", "dashed"),
 })
 
-op, ssm = _r("op"), _r("ssm")
+op, iap = _r("op"), _r("iap")
 vuln = _r("vuln")
 arm, intel = _r("arm"), _r("intel")
 nat, cor = _r("nat"), _r("corretto")
 
 # id: (path, colour key, label, label_x, label_y, anchor[, "dashed"])
 EDGES = {
-    "e_in":   (f"M{op[4]},{op[3]} V{ssm[1] - 5}", "purple",
-               "SSM only", op[4] + 14, gutter_y(0) + 6, "start"),
-    # SSM fans out to all three nodes; the centre edge carries the label.
-    "e_vuln": (f"M{ssm[4]},{ssm[3]} V{vuln[1] - 5}", "purple",
-               "exec . verdict", ssm[4] + 14, gutter_y(1) + 6, "start"),
-    "e_arm":  (f"M{ssm[4]},{ssm[3]} L{arm[4]},{arm[1] - 5}", "purple",
+    "e_in":   (f"M{op[4]},{op[3]} V{iap[1] - 5}", "purple",
+               "IAP only", op[4] + 14, gutter_y(0) + 6, "start"),
+    # IAP fans out to all three nodes; the centre edge carries the label.
+    "e_vuln": (f"M{iap[4]},{iap[3]} V{vuln[1] - 5}", "purple",
+               "ssh . verdict", iap[4] + 14, gutter_y(1) + 6, "start"),
+    "e_arm":  (f"M{iap[4]},{iap[3]} L{arm[4]},{arm[1] - 5}", "purple",
                "", 0, 0, "middle"),
-    "e_intel": (f"M{ssm[4]},{ssm[3]} L{intel[4]},{intel[1] - 5}", "purple",
+    "e_intel": (f"M{iap[4]},{iap[3]} L{intel[4]},{intel[1] - 5}", "purple",
                 "", 0, 0, "middle"),
     "e_eg":   (f"M{vuln[4]},{vuln[3]} V{nat[1] - 5}", "line",
                "egress", vuln[4] + 14, gutter_y(2) + 6, "start"),
@@ -138,19 +138,20 @@ EDGES = {
                "JDK pull", (nat[2] + cor[0]) / 2, nat[5] - 12, "middle", "dashed"),
 }
 
-ALT = ("The operator, running the AWS CLI and the public calif.io proof of "
-       "concept, reaches the lab only through AWS SSM - Session Manager and Run "
-       "Command - because the nodes have no inbound network path. "
-       "SSM drives three nodes in private subnets, and every node installs all "
+ALT = ("The operator, running the gcloud CLI and the public calif.io proof of "
+       "concept, reaches the lab only through Google's Identity-Aware Proxy - IAP "
+       "SSH and TCP tunnels - because the nodes have no external IP and the "
+       "firewall admits only the IAP range. "
+       "IAP reaches three nodes on a private subnet, and every node installs all "
        "three affected Java trains at once (Corretto 17.0.13, 21.0.13 and 25.0.5), "
        "so the detector must judge every installed JDK. One node is EXPOSED: "
-       "vuln-x86, a c7i x86 instance with the AVX-512 VBMI instruction the "
+       "vuln-x86, an n2 Ice Lake x86 instance with the AVX-512 VBMI instruction the "
        "vulnerable intrinsic needs, so all three of its JDKs are exposed. The "
        "other two run the same three vulnerable JDKs but are immune because "
-       "neither has AVX-512 VBMI: safe-arm, a t4g Graviton ARM64 instance, and "
-       "safe-intel, a t3 x86 instance. There is no pre-patched node; patch.sh "
+       "neither has AVX-512 VBMI: safe-arm, a c4a Google Axion ARM64 instance, "
+       "and safe-intel, an n1 x86 instance. There is no pre-patched node; patch.sh "
        "upgrades all three trains on a node live to flip it from EXPOSED to not "
-       "exposed. The nodes egress through a NAT gateway to pull pinned JDK "
+       "exposed. The nodes egress through Cloud NAT to pull pinned JDK "
        "tarballs from the Amazon Corretto archive.")
 
 # ------------------------------------------------------------------------------
